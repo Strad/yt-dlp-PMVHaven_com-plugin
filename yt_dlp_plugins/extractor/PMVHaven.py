@@ -76,7 +76,11 @@ class PMVHavenVideoIE(InfoExtractor):
         return []
 
     def _extract_creator(self, soup):
-        # Implement your method to extract creator here
+        desc_meta = soup.find('meta', attrs={'name': 'description'})
+        if desc_meta:
+            description = desc_meta['content']
+            creator = description.split()[-1]
+            return creator
         return None
 
     def _extract_stars(self, soup):
