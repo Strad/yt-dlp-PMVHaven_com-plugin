@@ -87,17 +87,23 @@ class PMVHavenVideoIE(InfoExtractor):
         return []
 
     def _extract_creator(self, soup):
+        og_title = soup.find('meta', attrs={'property': 'og:title'})
+        if og_title:
+            content = og_title.get('content', '')
+            suffix = ' - PMVHaven'
+            if content.endswith(suffix):
+                before_suffix = content[:-len(suffix)]
+                idx = before_suffix.rfind(' by ')
+                if idx >= 0:
+                    return before_suffix[idx + 4:]
+
         img = soup.find('img', alt=True, src=re.compile(r'/profiles/'))
         if img:
             return img['alt'].strip()
 
         for img in soup.find_all('img', alt=True):
             alt = img['alt'].strip()
-            if not alt:
-                continue
-            if alt.lower() == 'logo':
-                continue
-            if alt.startswith('Thumbnail at '):
+            if not alt or alt.lower() == 'logo' or alt.startswith('Thumbnail at '):
                 continue
             return alt
 
@@ -127,7 +133,52 @@ class PMVHavenVideoIE(InfoExtractor):
         return None
 
     def _extract_upload_date(self, soup):
-        # Implement your method to extract upload date here
+        """
+        Return YYYYMMDD (string) so yt-dlp's date filters (dateafter/datebefore) work.
+        Strategy:
+        1) Try common meta tags (uploadDate/datePublished/article:published_time).
+        2) Fallback: parse PMVHaven's Nuxt/JS state which contains "isoDate".
+        """
+        def _to_upload_date(val):
+            # Accept ISO8601 or YYYY-MM-DD; return YYYYMMDD or None
+            if not val:
+                return None
+            ts = parse_iso8601(val)
+            if ts:
+                return time.strftime('%Y%m%d', time.gmtime(ts))
+            m = re.match(r'(\d{4})-(\d{2})-(\d{2})', val)
+            if m:
+                return ''.join(m.groups())
+            return None
+
+        # 1) Common meta tags
+        meta_selectors = [
+            {'itemprop': 'uploadDate'},
+            {'itemprop': 'datePublished'},
+            {'property': 'article:published_time'},
+            {'name': 'publish_date'},
+            {'name': 'pubdate'},
+            {'name': 'date'},
+        ]
+        for sel in meta_selectors:
+            tag = soup.find('meta', attrs=sel)
+            content = tag.get('content') if tag else None
+            date_str = _to_upload_date(content)
+            if date_str:
+                return date_str
+
+        # 2) PMVHaven-specific: look inside scripts for "isoDate":"....Z"
+        for s in soup.find_all('script'):
+            txt = (s.string or s.get_text() or '')
+            m = re.search(r'"isoDate"\s*:\s*"([^"]+)"', txt)
+            if not m:
+                # Fallback: any ISO8601 Zulu timestamp (handles their packed arrays)
+                m = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)', txt)
+            if m:
+                date_str = _to_upload_date(m.group(1))
+                if date_str:
+                    return date_str
+
         return None
 
     def _extract_thumbnail(self, soup):
@@ -140,27 +191,40 @@ class PMVHavenVideoIE(InfoExtractor):
         return None
 
     def _extract_formats(self, soup, url):
+        """
+        Robustly extract the real MP4 URL for a PMVHaven video.
 
-        # collect .mp4 URLs (video.pmvhaven.com and storage.pmvhaven.com)
-        # score candidates 1. video.pmvhaven.com, 2. if first path segment looks like this page's video id, 3. bonus if slug/title words appear in the URL, 4. penalize /videoPreview/ or /previews/
-        # pick highest-scoring
-        
+        Strategy:
+        - Collect all .mp4 URLs from video.pmvhaven.com and storage.pmvhaven.com
+          in the page HTML.
+        - Add any og:video/twitter:player URL as a low-priority hint.
+        - Score candidates:
+            * Strong bonus for video.pmvhaven.com
+            * Bonus if first path segment looks like this page's video id
+            * Bonus if slug/title words appear in the URL
+            * Heavy penalty for /videoPreview/ or /previews/
+        - Pick the single highest-scoring candidate.
+        """
         import urllib.parse
 
         webpage = str(soup)
 
+        # Page title & normalized title for matching
         title = self._extract_title(soup) or ''
         title_norm = re.sub(r'\s+', ' ', title).strip().lower()
 
+        # Extract the 24-char video id from the page URL
         page_vid = self._search_regex(
             r'_([0-9a-fA-F]{24})', url, 'video id', default=None)
 
+        # Try to derive a slug from the URL between /video/ and _<id>
         slug = None
         m_slug = re.search(r'/video/([^_?]+)_[0-9a-fA-F]{24}', url)
         if m_slug:
             slug = urllib.parse.unquote(m_slug.group(1))
         slug_words = [w.lower() for w in re.split(r'[-_\s]+', slug or '') if len(w) > 2]
 
+        # For optional resolution metadata
         width = self._extract_width(soup)
         height = self._extract_height(soup)
         resolution = f'{width}x{height}' if width and height else None
@@ -196,21 +260,28 @@ class PMVHavenVideoIE(InfoExtractor):
             url_l = vurl.lower()
             score = base_score
 
+            # Heavy penalty for preview clips
             if is_preview(url_l):
                 score -= 20
 
+            # Prefer the new video backend over the old storage previews
             if parsed.netloc.startswith('video.pmvhaven.com'):
                 score += 10
             elif parsed.netloc.startswith('storage.pmvhaven.com'):
                 score += 0
+            elif parsed.netloc.startswith('pmvhavencloud.'):
+                score += 10
 
+            # Bonus if first path segment equals this page's video id
             if page_vid and id_in_url and id_in_url.lower() == page_vid.lower():
                 score += 10
 
+            # Bonus for slug words in the URL
             for w in slug_words:
                 if w and w in url_l:
                     score += 2
 
+            # Bonus for title words in the URL
             for w in re.split(r'\s+', title_norm):
                 if len(w) > 3 and w in url_l:
                     score += 1
@@ -222,16 +293,20 @@ class PMVHavenVideoIE(InfoExtractor):
                 'source': source,
             })
 
+        # 1) All mp4s from video.pmvhaven.com and storage.pmvhaven.com
+        #    URLs may use literal / or JSON-escaped \u002F (as in __NUXT_DATA__ blocks)
         _SEP = r'(?:/|\\u002F)'
         mp4_patterns = [
             rf'https?:{_SEP}{_SEP}video\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
             rf'https?:{_SEP}{_SEP}storage\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
+            rf'https?:{_SEP}{_SEP}pmvhavencloud\.[^"\'<>\s]+?\.mp4',
         ]
         for pattern in mp4_patterns:
             for u in re.findall(pattern, webpage):
                 u = u.replace('\\u002F', '/')  # decode JSON unicode escapes
                 add_candidate(u, base_score=0, source='scan')
 
+        # 2) Meta tags as a low-priority hint
         video_meta = soup.find('meta', attrs={'property': 'og:video:secure_url'})
         if not video_meta:
             video_meta = soup.find('meta', attrs={'name': 'twitter:player'})
@@ -241,6 +316,7 @@ class PMVHavenVideoIE(InfoExtractor):
         if not candidates:
             return []
 
+        # Deduplicate by URL, keeping the highest-scoring record
         unique = {}
         for c in candidates:
             u = c['url']
@@ -248,10 +324,11 @@ class PMVHavenVideoIE(InfoExtractor):
                 unique[u] = c
 
         all_cands = list(unique.values())
-
+        # Prefer non-preview if available at all
         non_preview = [c for c in all_cands if not c['is_preview']]
         chosen_pool = non_preview or all_cands
 
+        # Highest score wins; tie-breaker: longer URL (usually more descriptive filename)
         best = max(chosen_pool, key=lambda c: (c['score'], len(c['url'])))
 
         fmt = {
@@ -262,6 +339,7 @@ class PMVHavenVideoIE(InfoExtractor):
         if resolution:
             fmt['resolution'] = resolution
 
+        # Optional: infer height from "...1080p..." style hints
         m_h = re.search(r'(\d{3,4})p', best['url'])
         if m_h:
             h = int_or_none(m_h.group(1))
@@ -269,6 +347,8 @@ class PMVHavenVideoIE(InfoExtractor):
                 fmt['height'] = h
 
         return [fmt]
+
+
 
     def _extract_video_meta(self, soup):
         meta = {}
@@ -454,3 +534,104 @@ class PMVHavenUserIE(InfoExtractor):
         playlist_title = uploader_name
 
         return self.playlist_result(entries, playlist_id=playlist_id, playlist_title=playlist_title)
+
+
+class PMVHavenSubscriptionsIE(InfoExtractor):
+    IE_NAME = 'pmvhaven:subscriptions'
+    _VALID_URL = r'https?://(?:www\.)?pmvhaven\.com/subscriptions(?:[?#].*)?$'
+
+    _VIDEOS_API = 'https://pmvhaven.com/api/videos'
+    _PAGE_SIZE = 48
+
+    def _real_extract(self, url):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+
+        date_from = qs.get('dateFrom', [None])[0]
+        date_to = qs.get('dateTo', [None])[0]
+        exclude_promotional = qs.get('excludePromotional', ['false'])[0].lower() == 'true'
+
+        # Accept bare YYYY-MM-DD and expand to full ISO timestamps
+        if date_from and re.match(r'^\d{4}-\d{2}-\d{2}$', date_from):
+            date_from += 'T00:00:00.000Z'
+        if date_to and re.match(r'^\d{4}-\d{2}-\d{2}$', date_to):
+            date_to += 'T23:59:59.999Z'
+
+        entries = self._entries(date_from, date_to, exclude_promotional)
+        return self.playlist_result(
+            entries,
+            playlist_id='subscriptions',
+            playlist_title='PMVHaven Subscriptions',
+        )
+
+    def _fetch_page(self, page, date_from=None, date_to=None, exclude_promotional=False):
+        query = {
+            'limit': self._PAGE_SIZE,
+            'sort': '-releaseDate',
+            'page': page,
+            'tagMode': 'OR',
+            'expandTags': 'false',
+            'subscribedOnly': 'true',
+        }
+        if date_from:
+            query['uploadDateFrom'] = date_from
+        if date_to:
+            query['uploadDateTo'] = date_to
+        if exclude_promotional:
+            query['excludePromotional'] = 'true'
+        return self._download_json(
+            self._VIDEOS_API,
+            'subscriptions',
+            note=f'Downloading subscriptions page {page}',
+            query=query,
+        )
+
+    def _build_video_result(self, video_obj):
+        vid = traverse_obj(video_obj, ('_id', {str}))
+        if not vid:
+            return None
+
+        title = traverse_obj(video_obj, ('title', {str})) or vid
+        webpage_url = f'https://pmvhaven.com/video/video_{vid}'
+
+        ie_result = self.url_result(
+            webpage_url,
+            ie=PMVHavenVideoIE.ie_key(),
+            video_id=vid,
+            video_title=title,
+        )
+
+        iso = (traverse_obj(video_obj, ('releaseDate', {str}))
+               or traverse_obj(video_obj, ('uploadDate', {str})))
+        thumb_url = traverse_obj(video_obj, ('thumbnailUrl', {str}))
+        views = int_or_none(traverse_obj(video_obj, ('views', {int, str})))
+        uploader = traverse_obj(video_obj, ('uploader', {str}))
+
+        ie_result.update({
+            'thumbnail': thumb_url,
+            'timestamp': parse_iso8601(iso),
+            'uploader': uploader,
+            'view_count': views,
+        })
+        return ie_result
+
+    def _entries(self, date_from=None, date_to=None, exclude_promotional=False):
+        page = 1
+        total_pages = None
+        while True:
+            resp = self._fetch_page(page, date_from, date_to, exclude_promotional)
+            videos = traverse_obj(resp, ('videos', {list})) or []
+            if not videos:
+                break
+
+            if total_pages is None:
+                total_pages = int_or_none(
+                    traverse_obj(resp, ('pagination', 'totalPages')))
+
+            for video in videos:
+                result = self._build_video_result(video)
+                if result:
+                    yield result
+
+            page += 1
+            if total_pages is not None and page > total_pages:
+                break
